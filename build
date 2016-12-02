@@ -1,0 +1,6 @@
+#!/bin/bash
+
+cargo build &&
+cargo build --release && 
+strip -s target/release/rinit
+

@@ -1,31 +1,84 @@
+// A simple port of Suckless Tools' sinit[1] to Rust[2]
+//
+// [1] http://git.suckless.org/sinit
+// [2] https://www.rust-lang.org
+//
+// Author: Lee Braiden <leebraid@gmail.com>
+//
+
 extern crate libc;
+use std::ffi::CString;
 use std::mem;
 use std::ptr;
 
-enum ShutdownMode {
-    Reboot,
-    PowerOff,
+
+struct Config {
+    startup_command: Vec<String>,
+    shutdown_command: Vec<String>,
+    reboot_command: Vec<String>,
 }
 
-fn call_rc_shutdown(mode: ShutdownMode) {
-    let mode_str = match mode {
-        ShutdownMode::Reboot => "reboot",
-        ShutdownMode::PowerOff => "poweroff",
-    };
+fn get_libc_error() -> String {
+    let err_desc =
+        unsafe { std::ffi::CString::from_raw(libc::strerror(*libc::__errno_location())) };
 
-    let cmd_str = "/bin/rc.shutdown";
-    let cmd_res = std::process::Command::new(cmd_str).arg(mode_str).spawn();
+    err_desc.into_string().unwrap_or("unknown system error".to_string())
+}
 
-    if let Err(e) = cmd_res {
-        println!("Couldn't spawn /bin/rc.shutdown: {:?}", e);
+fn child_proc(args: Vec<CString>, sig_set: &libc::sigset_t) -> Result<libc::pid_t, String> {
+    // successfully forked; in child process now
+
+    let res = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, sig_set, ptr::null_mut()) };
+
+    if res != 0 {
+        Err("pthread_sigmask call failed: ".to_string() + get_libc_error().as_ref())
+
+    } else {
+        let err_desc = get_libc_error();
+        if unsafe { libc::setsid() } == -1 {
+            Err("setsid call failed: ".to_string() + err_desc.as_ref())
+
+        } else {
+            let mut new_args = args.iter().map(|arg| arg.as_ptr()).collect::<Vec<*const i8>>();
+            new_args.push(ptr::null());
+            new_args.shrink_to_fit();
+
+            unsafe { libc::execvp(args[0].as_ptr() as *const i8, &new_args[0]) };
+
+            // If we reach here, execvp failed, so handle the error.
+            // the parent function call is proceeding in parallel, and
+            // probably already completed, so just
+
+	    let msg = format!("ERROR: couldn't exec child process {}: {}", args.into_iter().map(|cs_arg| cs_arg.into_string().unwrap()).collect::<Vec<String>>().join(" "), get_libc_error());
+  	    Err(msg)
+        }
+
     }
 }
 
-fn sigpoweroff() {
-    call_rc_shutdown(ShutdownMode::PowerOff)
+fn spawn(args: &Vec<String>, sig_set: &libc::sigset_t) -> Result<libc::pid_t, String> {
+    match unsafe { libc::fork() } {
+        0 => {
+            child_proc(args.into_iter()
+                           .map(|arg| CString::new(arg.to_owned()).unwrap())
+                           .collect::<Vec<CString>>(),
+                       sig_set)
+        }
+        -1 => Err(get_libc_error()),
+        pid => Ok(pid),
+    }
 }
 
-fn sigreap() {
+fn do_cmd(cmd_args: &Vec<String>, sig_set: &libc::sigset_t) -> bool {
+    if let Err(e) = spawn(&cmd_args, sig_set) {
+        println!("{}", e);
+        false
+    } else {
+        true
+    }
+}
+
+fn sigreap() -> bool {
     loop {
         let res: i32;
         unsafe {
@@ -36,41 +89,56 @@ fn sigreap() {
             break;
         }
     }
+
+    true
 }
 
-fn sigreboot() {
-    call_rc_shutdown(ShutdownMode::Reboot)
+#[cfg(not(debug_assertions))]
+fn build_config() -> Config {
+    // Run commands in the /bin directory in release builds
+    Config {
+        startup_command: vec![ "/bin/rc.init".to_string(), ],
+        shutdown_command: vec![ "/bin/rc.shutdown".to_string(), "poweroff".to_string(), ],
+        reboot_command: vec![ "/bin/rc.shutdown".to_string(), "reboot".to_string(), ],
+    }
+}
+
+#[cfg(debug_assertions)]
+fn build_config() -> Config {
+    // Run commands in the local directory in debug builds
+    Config {
+        startup_command: vec![ "debug_init_scripts/rc.init".to_string(), ],
+        shutdown_command: vec![ "debug_init_scripts/rc.shutdown".to_string(), "poweroff".to_string(), ],
+        reboot_command: vec![ "debug_init_scripts/rc.shutdown".to_string(), "reboot".to_string(), ],
+    }
 }
 
 fn main() {
-    let pid: i32;
+    let config = build_config();
 
-    unsafe {
-        pid = libc::getpid();
-    }
-
-    if pid != 1 {
-        println!("ERROR: attempted to run init as a pid other than 0!");
-        //        std::process::exit(1i32);
+    #[cfg(build="release")]    {
+        if 1 != unsafe { libc::getpid() } {
+            println!("ERROR: attempted to run init as a pid other than 0!");
+            std::process::exit(1i32);
+        }
     }
 
     let mut sig_set: libc::sigset_t = unsafe { mem::zeroed() };
     unsafe {
-        #[allow(uninitialised)]
         let sig_set_ptr = &mut sig_set as *mut libc::sigset_t;
 
         libc::sigfillset(sig_set_ptr);
         libc::pthread_sigmask(libc::SIG_BLOCK, sig_set_ptr, ptr::null_mut());
     }
 
-    let cmd_res = std::process::Command::new("/bin/rc.init").spawn();
-    if let Err(e) = cmd_res {
-        println!("ERROR: Couldn't spawn /bin/rc.init: {:?}", e);
+    println!("Init: begin.");
+
+    if let false = do_cmd(&config.startup_command, &sig_set) {
         std::process::exit(1i32);
     }
 
-    println!("Running.");
-
+    println!("Init: up and running.");
+ 
     let mut sig = 0i32;
 
     loop {
@@ -78,11 +146,11 @@ fn main() {
             libc::sigwait(&mut sig_set as *mut libc::sigset_t, &mut sig as *mut i32);
         }
 
-        match sig {
-            libc::SIGUSR1 => sigpoweroff(),
+        let _ = match sig {
             libc::SIGCHLD => sigreap(),
-            libc::SIGINT => sigreboot(),
-            _ => {}
-        }
+            libc::SIGUSR1 => do_cmd(&config.shutdown_command, &sig_set),
+            libc::SIGINT => do_cmd(&config.reboot_command, &sig_set),
+            _ => true,
+        };
     }
 }
