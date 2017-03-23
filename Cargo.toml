@@ -10,5 +10,5 @@ license = "AGPL-3.0"
 libc = "^0"
 
 [badges]
-travis-ci = { repository = "https://github.com/lee-b/ruckless", branch = "master" }
+travis-ci = { repository = "lee-b/ruckless", branch = "master" }
 
