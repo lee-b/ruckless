@@ -7,7 +7,7 @@ repository = "https://github.com/lee-b/ruckless"
 license = "AGPL-3.0"
 
 [dependencies]
-libc = "*"
+libc = "^0"
 
 [badges]
 travis-ci = { repository = "https://github.com/lee-b/ruckless", branch = "master" }
